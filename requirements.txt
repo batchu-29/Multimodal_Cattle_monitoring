@@ -1,0 +1,7 @@
+numpy
+opencv-python
+ultralytics          # YOLO cow detector used by frame_extraction.py
+deeplabcut           # SuperAnimal-Quadruped pose model (pose_estimation.py); needs Python 3.10+
+google-genai         # Gemini on Vertex AI (gait_detection.py)
+google-cloud-bigquery
+pytest

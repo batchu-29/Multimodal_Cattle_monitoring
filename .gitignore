@@ -1,0 +1,17 @@
+# third-party sample media (YouTube videos, Wikimedia photos): fetch locally, do not redistribute
+samples/
+out/
+
+# model weights are downloaded automatically on first run
+*.pt
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# secrets / local config
+.env
+*.json.key
