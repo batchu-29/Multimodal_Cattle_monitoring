@@ -1,9 +1,6 @@
-# third-party sample media (YouTube videos, Wikimedia photos): fetch locally, do not redistribute
-samples/
-out/
-
-# model weights: downloaded automatically (YOLO) or kept outside git (trained acoustic models)
+# model weights: kept outside git, except the small YOLO file and the two acoustic models below
 *.pt
+!yolo11n.pt
 *.onnx
 *.h5
 *.keras
