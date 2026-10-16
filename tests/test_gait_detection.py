@@ -84,6 +84,15 @@ class PromptTests(unittest.TestCase):
         self.assertIn('"nose": [10.1, 20.5, 0.9]', contents[1])
         self.assertIn("200x120", contents[0])                 # image size, so coordinates have a scale
 
+    def test_prompt_has_a_generic_indian_breed_note_without_naming_breeds(self):
+        intro = gd.build_contents([RANKED[0]], fake_pose([0]))[0]
+        self.assertIn("Indian cattle vary a lot in build", intro)
+        self.assertIn("hump", intro)                        # natural anatomy, not lameness
+        self.assertIn("Build alone must not raise the score", intro)
+        self.assertIn("EARLY gait change", intro)           # the early-detection goal is still there
+        for breed in ("Gir", "Sahiwal", "Tharparkar", "zebu", "Murrah"):
+            self.assertNotIn(breed, intro)                  # generic: no hard-coded breeds
+
     def test_to_jpeg_downsizes_and_decodes(self):
         big = np.zeros((2000, 3000, 3), np.uint8)
         out = cv2.imdecode(np.frombuffer(gd.to_jpeg(big), np.uint8), cv2.IMREAD_COLOR)

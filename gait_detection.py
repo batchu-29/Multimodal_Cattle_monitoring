@@ -236,6 +236,12 @@ def build_contents(frames: Sequence[Frame], poses: Sequence[Pose]) -> Content:
 notice EARLY gait change before it becomes obvious lameness, so look closely for subtle signs and do not
 under-score a slightly abnormal gait. Do not diagnose a cause.
 
+Breed note: Indian cattle vary a lot in build. Many have a natural hump over the shoulders, a sloping
+rump, loose skin or a lean frame, and they look different from the Holstein-type animals the scale
+is usually illustrated with. These traits are normal anatomy, not signs of lameness. Judge each animal
+against her own build: look for a back that hunches upward behind the shoulders or loin, uneven or
+shortened steps, a head that nods, or a leg held or placed oddly. Build alone must not raise the score.
+
 {SCALE}
 
 Below are {len(frames)} frames of the same cow walking, taken at least {MIN_GAP_S}s apart, in time order.
