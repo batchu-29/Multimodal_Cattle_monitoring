@@ -57,7 +57,16 @@ class SuperAnimalBackend:
 
     def estimate_frames(self, frames: List[np.ndarray]) -> List[Pose]:
         """One Pose per frame, in order (empty Pose if nothing was detected). Frames must be the
-        same size. DeepLabCut's API takes videos, so they are written to a tiny temp clip."""
+        same size. A single frame is sent twice and the duplicate dropped, because DeepLabCut
+        fails on a one-frame video ("No pose predictions were made")."""
+        if not frames:
+            return []
+        padded = list(frames) if len(frames) >= 2 else [frames[0], frames[0]]
+        return self._infer(padded)[: len(frames)]
+
+    def _infer(self, frames: List[np.ndarray]) -> List[Pose]:
+        """Run the model on 2+ same-size frames. DeepLabCut's API takes videos, so they are
+        written to a tiny temp clip."""
         from deeplabcut.modelzoo.video_inference import video_inference_superanimal  # lazy: heavy
 
         work = tempfile.mkdtemp(prefix="dlc_")

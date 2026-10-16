@@ -12,6 +12,8 @@ __pycache__/
 .venv/
 venv/
 
-# secrets / local config
+# secrets / local config (API keys, Firebase service-account keys)
 .env
-*.json.key
+*adminsdk*.json
+serviceAccount*.json
+service-account*.json

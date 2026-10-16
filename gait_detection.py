@@ -1,26 +1,36 @@
-"""Gait detection v1: 5 frames -> pose -> Gemini -> one row in BigQuery.
+"""Gait detection v1: 5 frames -> pose -> Gemini -> one record in Firebase (Firestore).
 
     python gait_detection.py --cow Gauri --video clip.mp4
     python gait_detection.py --cow Gauri --video clip.mp4 --save-frames out/gait   # also dump frames
-    python gait_detection.py --cow Gauri --video clip.mp4 --init-table             # create BQ table
+    python gait_detection.py --cow Gauri --video clip.mp4 --dry-run                # never call out
 
 Flow (deliberately simple; the earlier metric/baseline version is in archive/):
   1. frame_extraction picks the 5 best frames of the clip (>= 0.5 s apart)
   2. pose_estimation gives the keypoint coordinates for each frame
   3. Gemini gets all 5 images plus their coordinates and returns a 1-5 gait score + one line
-  4. one BigQuery row: cow, time, the best frame's image, the one-line response, the score
+  4. one Firestore document with the whole record: cow, time, the best frame's image, the same
+     image with the pose overlay drawn on it, the keypoint coordinates (best frame, plus all 5
+     frames with their times), the one-line response, the score. Gemini sees the clean frames,
+     not the overlay.
 
 Trust gate: if Gemini says image_quality_ok is not true, or the score is not an integer 1-5,
-NO score is stored (the row is still written, score NULL, response says why).
+NO score is stored (the record is still written, score null, response says why).
 
-PLACEHOLDERS: set the project below (or env GCP_PROJECT_ID) to go live. While it is still
-the placeholder this runs as a dry run: frames and pose are real, Gemini and BigQuery are
-not called, and the prompt and the row are printed instead.
+CONFIG (copy .env.example to .env, which is git-ignored; never put secrets in code or in git):
+  Gemini, one of two routes:
+    GCP_PROJECT_ID        Vertex AI route: billed to your Google Cloud account/credits. Needs
+                          `gcloud auth application-default login` once. (GCP_LOCATION, default us-central1)
+    GEMINI_API_KEY        Gemini Developer API route: your key from AI Studio.
+    GEMINI_BACKEND        optional: force "vertex" or "api_key" (auto = Vertex when a project is set)
+  FIREBASE_CREDENTIALS  path to the Firebase service-account JSON (Project settings > Service accounts)
+  FIREBASE_PROJECT_ID   optional, only if it is not inside the JSON
+Whatever is missing is skipped and the run says so: with no Gemini route it is a dry run (frames
+and pose are real, Gemini is not called, the prompt is printed); with Gemini but no Firebase
+credentials it scores the cow and prints the record without saving it. Dry-run records are never saved.
 """
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import re
@@ -32,22 +42,44 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 
-# ----------------------------------------------------------------------------- placeholders
-PLACEHOLDER = "YOUR_GCP_PROJECT_ID"
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID", PLACEHOLDER)
-GEMINI_LOCATION = os.environ.get("GEMINI_LOCATION", "us-central1")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")   # check this id exists in your project
-BQ_DATASET = os.environ.get("BQ_DATASET", "cattle_monitor")
-BQ_TABLE = os.environ.get("BQ_TABLE", "gait_records")
-BQ_LOCATION = os.environ.get("BQ_LOCATION", "US")
+
+def load_env_file(path: str) -> None:
+    """Minimal .env reader: KEY=VALUE lines. Never overrides a variable that is already set.
+    utf-8-sig, because Windows editors and PowerShell often add an invisible BOM that would
+    otherwise glue itself onto the first variable's name and silently lose it."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+    except OSError:
+        pass
+
+
+load_env_file(os.path.join(HERE, ".env"))
+
+# ----------------------------------------------------------------------------- config
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")           # set => Gemini on Vertex AI (uses gcloud login)
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "global")   # the 3.x models are only served from "global"
+GEMINI_BACKEND = os.environ.get("GEMINI_BACKEND", "").lower()   # "vertex" | "api_key" | "" (auto)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")   # check this id exists on your backend
+FIREBASE_CREDENTIALS = os.environ.get("FIREBASE_CREDENTIALS", "")
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
+FIRESTORE_COLLECTION = os.environ.get("FIRESTORE_COLLECTION", "gait_records")
+PLACEHOLDER_MARK = "YOUR_"        # values copied straight from .env.example count as "not set"
 # -----------------------------------------------------------------------------
 
 N_FRAMES = 5
 MIN_GAP_S = 0.5
 MIN_KP_CONF = 0.3
 MAX_IMAGE_SIDE = 960
+MAX_STORED_IMAGE_BYTES = 450_000   # a Firestore document is capped at 1 MiB in total; we store 2 images
 
 Pose = Dict[str, Tuple[float, float, float]]
 Content = List[Union[str, bytes]]            # text parts are str, JPEG images are bytes
@@ -71,19 +103,61 @@ RESPONSE_SCHEMA = {
     "required": ["image_quality_ok", "gait_score", "summary"],
 }
 
-BQ_SCHEMA = [
-    ("record_id", "STRING", "REQUIRED"),
-    ("cow_name", "STRING", "REQUIRED"),
-    ("recorded_at", "TIMESTAMP", "REQUIRED"),
-    ("video_path", "STRING", "NULLABLE"),
-    ("image", "BYTES", "NULLABLE"),        # the best frame, JPEG
-    ("response", "STRING", "NULLABLE"),    # one line, e.g. "score=2 | slight head nod"
-    ("score", "INTEGER", "NULLABLE"),      # NULL when the answer failed the trust gate
-]
+# the fields of one record (the Firestore document id is record_id)
+ROW_FIELDS = ("record_id", "cow_name", "recorded_at", "video_path", "image", "overlay_image",
+              "frame_width", "frame_height", "keypoints", "frames", "response", "score")
+
+# keypoint pairs joined by a line in the overlay (spine, head, and the four legs)
+SKELETON = (
+    ("nose", "neck_base"), ("neck_base", "back_middle"), ("back_middle", "tail_base"),
+    ("front_left_thigh", "front_left_knee"), ("front_left_knee", "front_left_paw"),
+    ("front_right_thigh", "front_right_knee"), ("front_right_knee", "front_right_paw"),
+    ("hind_left_thigh", "hind_left_knee"), ("hind_left_knee", "hind_left_paw"),
+    ("hind_right_thigh", "hind_right_knee"), ("hind_right_knee", "hind_right_paw"),
+)
 
 
-def cloud_configured() -> bool:
-    return bool(PROJECT_ID) and PROJECT_ID != PLACEHOLDER
+def _is_set(value: str) -> bool:
+    return bool(value) and PLACEHOLDER_MARK not in value
+
+
+def gemini_backend() -> Optional[str]:
+    """Which Gemini route to use: "vertex" (Google Cloud project + gcloud login, billed to the
+    cloud account) or "api_key" (Gemini Developer API). Auto: Vertex when a project is set."""
+    if GEMINI_BACKEND == "vertex" or (GEMINI_BACKEND != "api_key" and _is_set(GCP_PROJECT_ID)):
+        return "vertex" if _is_set(GCP_PROJECT_ID) else None
+    return "api_key" if _is_set(GEMINI_API_KEY) else None
+
+
+def adc_available() -> bool:
+    """True if Google Application Default Credentials exist (`gcloud auth application-default login`)."""
+    try:
+        import google.auth
+
+        google.auth.default()
+        return True
+    except Exception:
+        return False
+
+
+def gemini_configured() -> bool:
+    backend = gemini_backend()
+    return backend == "api_key" or (backend == "vertex" and adc_available())
+
+
+def gemini_status() -> str:
+    """One line for the run log; says exactly what is missing."""
+    backend = gemini_backend()
+    if backend == "api_key":
+        return "live (Gemini API key)"
+    if backend == "vertex":
+        return (f"live (Vertex AI, project {GCP_PROJECT_ID}, {GCP_LOCATION})" if adc_available() else
+                "OFF (no gcloud login found: run `gcloud auth application-default login`)")
+    return "OFF (set GCP_PROJECT_ID for Vertex AI, or GEMINI_API_KEY, in .env)"
+
+
+def firebase_configured() -> bool:
+    return _is_set(FIREBASE_CREDENTIALS) and os.path.isfile(FIREBASE_CREDENTIALS)
 
 
 # ------------------------------------------------------------------ frames and pose
@@ -106,6 +180,31 @@ def pose_summary(pose: Pose, min_conf: float = MIN_KP_CONF) -> Dict[str, List[fl
     return {k: [round(x, 1), round(y, 1), round(c, 2)] for k, (x, y, c) in pose.items() if c >= min_conf}
 
 
+def keypoints_record(pose: Pose) -> Dict[str, Dict[str, float]]:
+    """All keypoints for storage as {name: {"x", "y", "conf"}} in pixels of the ORIGINAL frame.
+    Firestore cannot hold arrays inside arrays, so each point is a small map. Low-confidence
+    points are kept (with their conf) so nothing is lost; filter on conf when reading."""
+    return {k: {"x": round(x, 1), "y": round(y, 1), "conf": round(c, 3)} for k, (x, y, c) in pose.items()}
+
+
+def draw_overlay(frame: np.ndarray, pose: Pose, min_conf: float = MIN_KP_CONF) -> np.ndarray:
+    """Copy of the frame with the pose drawn on it: confident keypoints green, skeleton lines
+    yellow, low-confidence keypoints small red dots. Marker size scales with the image."""
+    img = frame.copy()
+    scale = max(img.shape[:2]) / 480.0
+    radius, thick = max(2, int(round(3 * scale))), max(1, int(round(1.5 * scale)))
+    for a, b in SKELETON:
+        if a in pose and b in pose and pose[a][2] >= min_conf and pose[b][2] >= min_conf:
+            cv2.line(img, (int(pose[a][0]), int(pose[a][1])), (int(pose[b][0]), int(pose[b][1])),
+                     (0, 220, 255), thick, cv2.LINE_AA)
+    for x, y, c in pose.values():
+        if c >= min_conf:
+            cv2.circle(img, (int(x), int(y)), radius, (0, 200, 0), -1, cv2.LINE_AA)
+        else:
+            cv2.circle(img, (int(x), int(y)), max(1, radius - 1), (0, 0, 255), -1, cv2.LINE_AA)
+    return img
+
+
 def to_jpeg(frame: np.ndarray, max_side: int = MAX_IMAGE_SIDE, quality: int = 85) -> bytes:
     h, w = frame.shape[:2]
     scale = min(1.0, max_side / max(h, w))
@@ -115,6 +214,18 @@ def to_jpeg(frame: np.ndarray, max_side: int = MAX_IMAGE_SIDE, quality: int = 85
     if not ok:
         raise ValueError("could not encode frame")
     return buf.tobytes()
+
+
+def fit_jpeg(frame: np.ndarray, max_bytes: int = MAX_STORED_IMAGE_BYTES) -> bytes:
+    """JPEG small enough to live inside a Firestore document: lower quality, then shrink."""
+    side = MAX_IMAGE_SIDE
+    for _ in range(8):
+        for quality in (85, 70, 55, 40):
+            data = to_jpeg(frame, side, quality)
+            if len(data) <= max_bytes:
+                return data
+        side = int(side * 0.75)
+    return data
 
 
 # ------------------------------------------------------------------ Gemini
@@ -166,15 +277,21 @@ def one_line(score: Optional[int], text: str, limit: int = 300) -> str:
     return line if len(line) <= limit else line[: limit - 3] + "..."
 
 
-def vertex_generate(
-    project: str = PROJECT_ID, location: str = GEMINI_LOCATION, model: str = GEMINI_MODEL
-) -> Generate:
-    """Gemini on Vertex AI via google-genai. Uses Application Default Credentials
-    (`gcloud auth application-default login`)."""
+def _redact(text: str, secret: str) -> str:
+    """Error messages must never carry the API key into the database or the logs."""
+    return text.replace(secret, "***") if secret else text
+
+
+def gemini_generate(model: Optional[str] = None) -> Generate:
+    """Gemini via Vertex AI (project + gcloud login) or the Gemini API (key), per gemini_backend()."""
     from google import genai
     from google.genai import types
 
-    client = genai.Client(vertexai=True, project=project, location=location)
+    model = model or GEMINI_MODEL
+    if gemini_backend() == "vertex":
+        client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location=GCP_LOCATION)
+    else:
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
     def generate(contents: Content) -> str:
         parts = [
@@ -193,39 +310,27 @@ def vertex_generate(
     return generate
 
 
-# ------------------------------------------------------------------ BigQuery
-class BigQueryWriter:
-    """Appends rows with a load job (works on BigQuery sandbox, where streaming inserts do not)."""
+# ------------------------------------------------------------------ Firebase
+class FirestoreWriter:
+    """One Firestore document per record, in the `gait_records` collection (id = record_id)."""
 
-    def __init__(self, project: str = PROJECT_ID, dataset: str = BQ_DATASET, table: str = BQ_TABLE,
-                 location: str = BQ_LOCATION, client: Any = None):
-        from google.cloud import bigquery
+    def __init__(self, credentials_path: str = FIREBASE_CREDENTIALS, project_id: str = FIREBASE_PROJECT_ID,
+                 collection: str = FIRESTORE_COLLECTION, client: Any = None):
+        if client is None:
+            import firebase_admin
+            from firebase_admin import credentials, firestore
 
-        self._bq = bigquery
-        self.client = client or bigquery.Client(project=project, location=location)
-        self.dataset_id = f"{project}.{dataset}"
-        self.table_id = f"{project}.{dataset}.{table}"
-        self.location = location
-
-    def _schema(self):
-        return [self._bq.SchemaField(n, t, m) for n, t, m in BQ_SCHEMA]
-
-    def ensure_table(self) -> None:
-        """Create the dataset and table if missing. A cloud write: run once on purpose."""
-        ds = self._bq.Dataset(self.dataset_id)
-        ds.location = self.location
-        self.client.create_dataset(ds, exists_ok=True)
-        table = self._bq.Table(self.table_id, schema=self._schema())
-        table.time_partitioning = self._bq.TimePartitioning(field="recorded_at")
-        table.clustering_fields = ["cow_name"]
-        self.client.create_table(table, exists_ok=True)
+            if not firebase_admin._apps:
+                firebase_admin.initialize_app(
+                    credentials.Certificate(credentials_path), {"projectId": project_id} if project_id else None
+                )
+            client = firestore.client()
+        self.client = client
+        self.collection = collection
 
     def add(self, row: Dict[str, Any]) -> None:
-        job = self.client.load_table_from_json(
-            [row], self.table_id,
-            job_config=self._bq.LoadJobConfig(write_disposition="WRITE_APPEND", schema=self._schema()),
-        )
-        job.result()
+        doc = {k: v for k, v in row.items() if k != "record_id"}
+        self.client.collection(self.collection).document(row["record_id"]).set(doc)
 
 
 # ------------------------------------------------------------------ the run
@@ -241,10 +346,11 @@ def run(
     now: Optional[datetime] = None,
     log: Callable[[str], None] = print,
     capture: Optional[Dict[str, Any]] = None,
+    secret: str = "",
 ) -> Optional[Dict[str, Any]]:
-    """Returns the row (or None if no usable frames). With generate=None Gemini is not called;
-    with writer=None nothing is written. `capture`, if given, is filled with the ranked frames,
-    their poses and the exact contents sent to Gemini (for previews and debugging)."""
+    """Returns the record (or None if no usable frames). With generate=None Gemini is not called
+    and nothing is saved; with writer=None nothing is saved. `capture`, if given, is filled with
+    the ranked frames, their poses and the exact contents sent to Gemini (for previews)."""
     ranked = pick(video_path, n_frames)             # best first
     if not ranked:
         log("No clean frame found in the clip; nothing to score.")
@@ -253,7 +359,6 @@ def run(
     log(f"picked {len(ranked)} frames at t=" + ", ".join(f"{t:.1f}s" for _, t in ranked)
         + "; confident keypoints per frame: " + ", ".join(str(len(pose_summary(p))) for p in poses))
 
-    best_jpeg = to_jpeg(ranked[0][0])               # saved image = the best-ranked frame
     order = sorted(range(len(ranked)), key=lambda i: ranked[i][1])   # Gemini sees them in time order
     contents = build_contents([ranked[i] for i in order], [poses[i] for i in order])
 
@@ -264,21 +369,29 @@ def run(
         try:
             score, text = parse_response(generate(contents))
             response = one_line(score, text)
-        except Exception as exc:                     # network, quota, auth: keep an audit row
-            response = one_line(None, f"ERROR {type(exc).__name__}: {exc}")
+        except Exception as exc:                     # network, quota, auth: keep an audit record
+            response = one_line(None, _redact(f"ERROR {type(exc).__name__}: {exc}", secret))
 
     row = {
         "record_id": str(uuid.uuid4()),
         "cow_name": cow_name,
-        "recorded_at": (now or datetime.now(timezone.utc)).isoformat(),
+        "recorded_at": now or datetime.now(timezone.utc),
         "video_path": video_path,
-        "image": base64.b64encode(best_jpeg).decode("ascii"),   # BYTES in a JSON load job = base64
+        "image": fit_jpeg(ranked[0][0]),             # saved image = the best-ranked frame
+        "overlay_image": fit_jpeg(draw_overlay(ranked[0][0], poses[0])),   # same frame with the pose drawn
+        "frame_width": int(ranked[0][0].shape[1]),   # keypoint coordinates are in these pixels
+        "frame_height": int(ranked[0][0].shape[0]),
+        "keypoints": keypoints_record(poses[0]),     # keypoints of the saved (best) frame
+        "frames": [                                  # all frames Gemini saw, in time order
+            {"time_s": round(ranked[i][1], 2), "rank": i + 1, "keypoints": keypoints_record(poses[i])}
+            for i in order
+        ],
         "response": response,
         "score": score,
     }
     if capture is not None:
         capture.update(frames=[f for f, _ in ranked], poses=poses, contents=contents)
-    if writer is not None:
+    if writer is not None and generate is not None:  # dry-run records are never saved
         writer.add(row)
     return row
 
@@ -288,41 +401,43 @@ def _preview(contents: Content) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Gait check: 5 frames -> pose -> Gemini -> BigQuery.")
+    p = argparse.ArgumentParser(description="Gait check: 5 frames -> pose -> Gemini -> Firestore.")
     p.add_argument("--cow", required=True, help="cow name / tag")
     p.add_argument("--video", required=True, help="short side-view walking clip")
     p.add_argument("--frames", type=int, default=N_FRAMES)
-    p.add_argument("--dry-run", action="store_true", help="never call Gemini or BigQuery")
-    p.add_argument("--init-table", action="store_true", help="create the BigQuery dataset/table first")
+    p.add_argument("--dry-run", action="store_true", help="never call Gemini or Firebase")
     p.add_argument("--save-frames", metavar="DIR", help="write the picked frames with keypoints drawn")
     args = p.parse_args(argv)
 
-    live = cloud_configured() and not args.dry_run
-    if not live:
-        why = "--dry-run" if args.dry_run else "GCP project is still the placeholder"
-        print(f"DRY RUN ({why}): Gemini and BigQuery will not be called.")
-    generate = vertex_generate() if live else None
-    writer = BigQueryWriter() if live else None
-    if live and args.init_table:
-        writer.ensure_table()
+    use_gemini = gemini_configured() and not args.dry_run
+    use_firebase = use_gemini and firebase_configured()
+    print("Gemini:   " + ("OFF (--dry-run)" if args.dry_run else gemini_status()))
+    print("Firebase: " + ("live" if use_firebase else
+                          "OFF (set FIREBASE_CREDENTIALS in .env; records will not be saved)"
+                          if use_gemini else "OFF"))
+
+    generate = gemini_generate() if use_gemini else None
+    writer = FirestoreWriter() if use_firebase else None
 
     captured: Dict[str, Any] = {}
-    row = run(args.cow, args.video, args.frames, generate=generate, writer=writer, capture=captured)
+    row = run(args.cow, args.video, args.frames, generate=generate, writer=writer,
+              capture=captured, secret=GEMINI_API_KEY)
     if row is None:
         return 1
 
     if args.save_frames:
         os.makedirs(args.save_frames, exist_ok=True)
         for i, (img, pose) in enumerate(zip(captured["frames"], captured["poses"]), 1):
-            img = img.copy()
-            for _, (x, y, c) in pose.items():
-                cv2.circle(img, (int(x), int(y)), 3, (0, 255, 0) if c >= MIN_KP_CONF else (0, 0, 255), -1)
-            cv2.imwrite(os.path.join(args.save_frames, f"frame{i}.jpg"), img)
+            cv2.imwrite(os.path.join(args.save_frames, f"frame{i}.jpg"), draw_overlay(img, pose))
 
-    if not live:
+    if generate is None:
         print("\n--- what Gemini would receive ---\n" + _preview(captured["contents"]))
-    shown = dict(row, image=f"<{len(row['image'])} base64 chars>")
-    print("\n--- row" + (" written to BigQuery ---" if live else " (not written) ---"))
+    shown = dict(row, image=f"<{len(row['image'])} bytes JPEG>",
+                 overlay_image=f"<{len(row['overlay_image'])} bytes JPEG>",
+                 keypoints=f"<{len(row['keypoints'])} keypoints>",
+                 frames=[f"t={f['time_s']}s rank {f['rank']}: {len(f['keypoints'])} keypoints" for f in row["frames"]],
+                 recorded_at=row["recorded_at"].isoformat())
+    print("\n--- record" + (" saved to Firestore ---" if writer is not None else " (not saved) ---"))
     print(json.dumps(shown, indent=2))
     return 0
 
