@@ -236,6 +236,62 @@ def has_nested_array(obj, inside_list=False):
     return False
 
 
+class RetryTests(unittest.TestCase):
+    def test_retries_temporary_errors_then_succeeds(self):
+        calls, waits = [], []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("503 UNAVAILABLE. The service is currently unavailable.")
+            return "ok"
+
+        self.assertEqual(gd.with_retries(flaky, delays=(1, 2, 3), sleep=waits.append), "ok")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(waits, [1, 2])
+
+    def test_rate_limit_is_temporary(self):
+        self.assertTrue(gd._is_temporary(RuntimeError("429 RESOURCE_EXHAUSTED")))
+
+    def test_permanent_errors_are_not_retried(self):
+        calls = []
+
+        def broken():
+            calls.append(1)
+            raise RuntimeError("403 PERMISSION_DENIED")
+
+        with self.assertRaises(RuntimeError):
+            gd.with_retries(broken, delays=(1, 2), sleep=lambda s: None)
+        self.assertEqual(len(calls), 1)
+
+    def test_gives_up_after_the_last_delay_and_raises(self):
+        calls = []
+
+        def always_down():
+            calls.append(1)
+            raise RuntimeError("503 UNAVAILABLE")
+
+        with self.assertRaises(RuntimeError):
+            gd.with_retries(always_down, delays=(1, 2), sleep=lambda s: None)
+        self.assertEqual(len(calls), 3)               # first try + 2 retries
+
+
+class ImageInputTests(unittest.TestCase):
+    def test_a_still_image_is_one_frame_at_time_zero(self):
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(), "cow.PNG")           # extension check is case-insensitive
+        cv2.imwrite(path, frame(77))
+        frames = gd.pick_frames(path, 5)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0][1], 0.0)
+        self.assertEqual(frames[0][0].shape[:2], (120, 200))
+
+    def test_unreadable_image_raises_a_clear_error(self):
+        with self.assertRaises(FileNotFoundError):
+            gd.pick_frames(os.path.join(os.path.dirname(__file__), "no_such_photo.jpg"), 1)
+
+
 class KeypointRecordTests(unittest.TestCase):
     def run_distinct(self):
         # a different x per frame, so the "best frame" keypoints can be told apart

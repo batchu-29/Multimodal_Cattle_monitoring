@@ -68,13 +68,16 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")           # set => Gemini on Vertex AI (uses gcloud login)
 GCP_LOCATION = os.environ.get("GCP_LOCATION", "global")   # the 3.x models are only served from "global"
 GEMINI_BACKEND = os.environ.get("GEMINI_BACKEND", "").lower()   # "vertex" | "api_key" | "" (auto)
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")   # check this id exists on your backend
+# gemini-3.5-flash-lite is cheaper but scored a clearly arched-back cow as 1 ("level back"); flash scored it 3
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")   # check this id exists on your backend
+RETRY_DELAYS_S = (5, 15, 30)         # waits before retrying a temporary Gemini error (429 / 503)
 FIREBASE_CREDENTIALS = os.environ.get("FIREBASE_CREDENTIALS", "")
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
 FIRESTORE_COLLECTION = os.environ.get("FIRESTORE_COLLECTION", "gait_records")
 PLACEHOLDER_MARK = "YOUR_"        # values copied straight from .env.example count as "not set"
 # -----------------------------------------------------------------------------
 
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 N_FRAMES = 5
 MIN_GAP_S = 0.5
 MIN_KP_CONF = 0.3
@@ -162,7 +165,14 @@ def firebase_configured() -> bool:
 
 # ------------------------------------------------------------------ frames and pose
 def pick_frames(video_path: str, n: int = N_FRAMES, min_gap_s: float = MIN_GAP_S) -> List[Frame]:
-    """The n best frames of the clip, best first, from frame_extraction."""
+    """The n best frames of the clip, best first, from frame_extraction. A still image (.jpg, .png ...)
+    is taken as the single frame, so photos can be scored too (no motion, t = 0)."""
+    if os.path.splitext(video_path)[1].lower() in IMAGE_EXTENSIONS:
+        img = cv2.imread(video_path)
+        if img is None:
+            raise FileNotFoundError(f"cannot read image: {video_path}")
+        return [(img, 0.0)]
+
     from frame_extraction import YoloCattleDetector, select_best_frames
 
     best = select_best_frames(video_path, YoloCattleDetector(), top_k=n, min_gap_s=min_gap_s)
@@ -288,6 +298,27 @@ def _redact(text: str, secret: str) -> str:
     return text.replace(secret, "***") if secret else text
 
 
+def _is_temporary(exc: Exception) -> bool:
+    """Rate limit / overload: worth waiting and retrying. Auth, billing and bad-model errors are not."""
+    text = f"{type(exc).__name__} {exc}"
+    return any(m in text for m in ("429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "500 INTERNAL"))
+
+
+def with_retries(fn: Callable[[], Any], delays: Sequence[float] = RETRY_DELAYS_S,
+                 sleep: Callable[[float], None] = None) -> Any:
+    import time
+
+    sleep = sleep or time.sleep
+    for delay in delays:
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_temporary(exc):
+                raise
+            sleep(delay)
+    return fn()                       # last attempt: let any error propagate
+
+
 def gemini_generate(model: Optional[str] = None) -> Generate:
     """Gemini via Vertex AI (project + gcloud login) or the Gemini API (key), per gemini_backend()."""
     from google import genai
@@ -304,13 +335,13 @@ def gemini_generate(model: Optional[str] = None) -> Generate:
             types.Part.from_bytes(data=c, mime_type="image/jpeg") if isinstance(c, bytes) else c
             for c in contents
         ]
-        resp = client.models.generate_content(
+        resp = with_retries(lambda: client.models.generate_content(
             model=model,
             contents=parts,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json", response_schema=RESPONSE_SCHEMA, temperature=0.0
             ),
-        )
+        ))
         return resp.text
 
     return generate
