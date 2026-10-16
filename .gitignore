@@ -2,8 +2,18 @@
 samples/
 out/
 
-# model weights are downloaded automatically on first run
+# model weights: downloaded automatically (YOLO) or kept outside git (trained acoustic models)
 *.pt
+*.onnx
+*.h5
+*.keras
+*.pkl
+*.joblib
+/models/*
+# the two acoustic models are committed on purpose (0.4 MB and 62 MB)
+!/models/acoustics/
+!/models/acoustics/xgb_model.onnx
+!/models/acoustics/cow_model.onnx
 
 # python
 __pycache__/

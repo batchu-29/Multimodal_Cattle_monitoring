@@ -1,0 +1,5 @@
+numpy
+librosa           # MFCC and mel-spectrogram features
+onnxruntime       # runs the bite/chew and distress ONNX models
+Pillow            # resizes the spectrogram image
+paho-mqtt         # tools/ scripts that send or receive microphone chunks over MQTT
